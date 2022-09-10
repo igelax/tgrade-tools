@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	wasmtypes "github.com/CosmWasm/wasmd/x/wasm/types"
@@ -16,10 +17,10 @@ import (
 	poetypes "github.com/confio/tgrade/x/poe/types"
 )
 
-type Coin struct {
-	Denom  string `json:"denom"`
-	Amount uint64 `json:"amount,string"`
-}
+const (
+	FlagMinDelegate = "min-amount"
+	FlagReserve     = "reserve-amount"
+)
 
 func ExecuteCompound() *cobra.Command {
 	cmd := &cobra.Command{
@@ -37,37 +38,63 @@ func ExecuteCompound() *cobra.Command {
 			if err != nil {
 				return sdkerrors.Wrap(err, "address")
 			}
-			var minAmount uint64 = 2_000_000
+
+			minStr, err := cmd.Flags().GetString(FlagMinDelegate)
+			if err != nil {
+				return err
+			}
+			minAmount, err := sdk.ParseCoinNormalized(minStr)
+			switch {
+			case err != nil:
+				return err
+			case minAmount.IsZero():
+				return errors.New("empty minimum amount")
+			case minAmount.Denom != "utgd":
+				return errors.New("utgd denom required")
+			}
+			reserveStr, err := cmd.Flags().GetString(FlagReserve)
+			if err != nil {
+				return err
+			}
+			resAmount, err := sdk.ParseCoinNormalized(reserveStr)
+			switch {
+			case err != nil:
+				return err
+			case resAmount.Denom != "utgd":
+				return errors.New("utgd denom required")
+			}
+			thresholdAmount := minAmount.Add(resAmount)
+			claimedReward := sdk.NewCoin("utgd", sdk.ZeroInt())
 
 			txf := tx.NewFactoryCLI(clientCtx, cmd.Flags()).
 				WithTxConfig(clientCtx.TxConfig).WithAccountRetriever(clientCtx.AccountRetriever)
-
 			queryClient := wasmtypes.NewQueryClient(clientCtx)
+
 			var msgs []sdk.Msg
-			var claimedReward uint64
 			for _, c := range []string{DistributionAddr, EngagementAddr} {
 				_, contractResp, err := queryRewards(ownerAddr, queryClient, c)
 				if err != nil {
 					return err
 				}
-				if contractResp.Rewards.Amount > minAmount { // claim only when rewards > min
-					cmd.Printf("claiming %s rewards: %d\n", c, contractResp.Rewards.Amount)
+				if contractResp.Rewards.IsGTE(thresholdAmount) { // claim only when rewards > min
+					cmd.Printf("claiming %s rewards: %d\n", c, contractResp.Rewards)
 					receiverAddr := fromAddr
 					msg, err := newClaimMsg(c, fromAddr, receiverAddr)
 					if err != nil {
 						return err
 					}
 					msgs = append(msgs, msg)
-					claimedReward += contractResp.Rewards.Amount
+					claimedReward = claimedReward.Add(contractResp.Rewards)
 				}
 			}
 			if len(msgs) == 0 {
 				cmd.Print("no rewards to claim. skipping")
 				return nil
 			}
-			if claimedReward > minAmount {
-				cmd.Printf("delegating claimed rewards: %d\n", claimedReward)
-				msg := poetypes.NewMsgDelegate(ownerAddr, sdk.NewInt64Coin("utgd", int64(claimedReward)), sdk.NewInt64Coin("utgd", 0))
+			if claimedReward.IsGTE(thresholdAmount) {
+				delegateAmoung := claimedReward.Sub(resAmount)
+				cmd.Printf("delegating claimed rewards: %d\n", delegateAmoung)
+				msg := poetypes.NewMsgDelegate(ownerAddr, delegateAmoung, sdk.NewCoin("utgd", sdk.ZeroInt()))
 				if err := msg.ValidateBasic(); err != nil {
 					return sdkerrors.Wrap(err, "delegate msg")
 				}
@@ -81,7 +108,8 @@ func ExecuteCompound() *cobra.Command {
 		},
 	}
 	flags.AddTxFlagsToCmd(cmd)
-
+	cmd.Flags().String(FlagMinDelegate, "2tgd", "The minimum amount to claim and delegate.")
+	cmd.Flags().String(FlagReserve, "20000utgd", "The reward mount that should not be delegated")
 	return cmd
 }
 
@@ -99,7 +127,7 @@ func newClaimMsg(contractAddr string, fromAddr string, receiverAddr string) (*wa
 
 // RewardsResponse smart query response
 type RewardsResponse struct {
-	Rewards Coin `json:"rewards"`
+	Rewards sdk.Coin `json:"rewards"`
 }
 
 func queryRewards(ownerAddr sdk.AccAddress, queryClient wasmtypes.QueryClient, contractAddr string) (*wasmtypes.QuerySmartContractStateResponse, RewardsResponse, error) {
@@ -112,17 +140,11 @@ func queryRewards(ownerAddr sdk.AccAddress, queryClient wasmtypes.QueryClient, c
 		},
 	)
 	if err != nil {
-		return nil, struct {
-			Rewards Coin `json:"rewards"`
-		}{}, sdkerrors.Wrapf(err, "smart query: %q", query)
+		return nil, RewardsResponse{}, sdkerrors.Wrapf(err, "smart query: %q", query)
 	}
-	contractResp := struct {
-		Rewards Coin `json:"rewards"`
-	}{}
+	var contractResp RewardsResponse
 	if err := json.Unmarshal(res.Data, &contractResp); err != nil {
-		return nil, struct {
-			Rewards Coin `json:"rewards"`
-		}{}, sdkerrors.Wrap(err, "unmarshal result")
+		return nil, contractResp, sdkerrors.Wrap(err, "unmarshal result")
 	}
 	return res, contractResp, nil
 }
